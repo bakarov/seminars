@@ -1,0 +1,1622 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Векторные представления слов\n",
+    "\n",
+    "Векторые представления лингвистических объектов (слов, предложений, текстов) являются одним из основных инструментов, используемых в компьютерной лингвистике. Они применяются во всех задачах, связанных с обработкой естественного языка. На предыдущих семинарах мы уже рассматривали векторные модели текстов: терм-документные матрицы, латентно-семантический анализ, размещение Дирихле. На этом семинаре мы подробнее разберём наиболее популярные алгоритмы построения таких моделей, применим их на реальной задаче, и попытаемся понять, в чём преимущества и недостатки каждой из них."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 87,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from os import walk, path\n",
+    "from collections import defaultdict, Counter\n",
+    "from ufal.udpipe import Model, Pipeline, ProcessingError\n",
+    "from pandas import DataFrame, read_csv\n",
+    "\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.model_selection import KFold\n",
+    "from sklearn.metrics import f1_score, accuracy_score\n",
+    "from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, HashingVectorizer\n",
+    "from sklearn.naive_bayes import MultinomialNB\n",
+    "from sklearn.manifold import TSNE\n",
+    "from sklearn.decomposition import TruncatedSVD\n",
+    "from sklearn.preprocessing import Normalizer, LabelEncoder\n",
+    "from sklearn.linear_model import LogisticRegression\n",
+    "from sklearn.metrics.pairwise import cosine_similarity\n",
+    "\n",
+    "from scipy import sparse\n",
+    "from scipy.spatial.distance import cosine\n",
+    "\n",
+    "from gensim.models import KeyedVectors, Word2Vec\n",
+    "\n",
+    "from math import log\n",
+    "import numpy as np\n",
+    "import itertools"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Классификация текстов: 20 Newsgroups\n",
+    "\n",
+    "Пример использования векторных моделей будет показан на классической задаче классификации текстов. Она состоит в том, чтобы соотнести набор текстов с набором меток. Для начала загрузим датасет, который будет использоваться для классификации -- это классический датасет 20 Newsgroups.\n",
+    "\n",
+    "Датасет сделан на английском языке, в котором существует множество случаев омонимии частей речи. Поэтому предобработка датасета будет заключаться в определении частей речи для каждого слова из каждого текста (и последующей лемматизации). Для этого мы будем использовать тэггер UDPipe (он также используется для токенизации и лемматизации, а ещё может делать синтаксический парсинг).\n",
+    "\n",
+    "Множество \"готовых\" (предобученных) векторных моделей обучены на корпусах с частеречной разметкой. Мы сделаем два варианта датасета -- с разметкой и без -- для того, чтобы можно было работать с разными типами моделей."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def read_dataset(dataset_path=path.join('datasets', '20news-18828')):\n",
+    "    dataset = defaultdict(lambda: [])\n",
+    "    errors = []\n",
+    "    for root, dirs, files in walk(dataset_path):\n",
+    "        for file in files:\n",
+    "            with open(path.join(root, file), 'r', encoding='utf-8') as f:\n",
+    "                try:\n",
+    "                    dataset[root.split('/')[~0]].append(f.read().replace('\\n', ' '))\n",
+    "                except UnicodeDecodeError:\n",
+    "                    errors.append(path.join(root, file))\n",
+    "    return dataset, errors"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def preprocess_texts(texts, add_pos=True):\n",
+    "    parsed_texts = []\n",
+    "    for text in texts:\n",
+    "        parsed_text = []\n",
+    "        for par in pipeline.process(text).split('\\n\\n')[:~0]:\n",
+    "            for word_parse in par.split('\\n'):\n",
+    "                if word_parse[0].isdigit():\n",
+    "                    word_data = word_parse.split('\\t')\n",
+    "                    lemma = word_data[2]\n",
+    "                    pos = word_data[3]\n",
+    "                    if str(pos) != 'PUNCT':\n",
+    "                        if add_pos:\n",
+    "                            parsed_text.append('{}_{}'.format(lemma, pos))\n",
+    "                        else:\n",
+    "                            parsed_text.append(lemma)\n",
+    "        parsed_texts.append(' '.join(parsed_text))\n",
+    "    return parsed_texts"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Загружаем модель UDPipe для английского языка (готовые модели для лемматизации и всего прочего есть также и для множества других языков, включая русский):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_path = path.join('data', 'english-ud-2.1.udpipe')\n",
+    "model = Model.load(model_path)\n",
+    "pipeline = Pipeline(model, 'tokenize', Pipeline.DEFAULT, Pipeline.DEFAULT, 'conllu')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Я заранее подготовил обработанные датасеты в табличном (.csv) формате:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def read_dataset_csv_format(path_to_csv=path.join('data', '20NG_no_pos.csv')):\n",
+    "    try:\n",
+    "        df = read_csv(path_to_csv)\n",
+    "    except FileNotFoundError:\n",
+    "        print('.csv not found, reading')\n",
+    "        dataset = read_dataset()\n",
+    "        data = defaultdict(lambda: [])\n",
+    "        for key, value in dataset.items():\n",
+    "            data[key] = preprocess_texts(value)\n",
+    "        texts = []\n",
+    "        classes = []\n",
+    "        for key, value in data.items():\n",
+    "            for text in value:\n",
+    "                texts.append(text)\n",
+    "                classes.append(key)\n",
+    "        df = DataFrame({'texts': texts, 'classes': classes})\n",
+    "        df.to_csv('20NG.csv')\n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = read_dataset_csv_format()\n",
+    "le = LabelEncoder()\n",
+    "df['classes_n'] = le.fit_transform(df.classes)\n",
+    "train, test = train_test_split(df, test_size=0.3)\n",
+    "train = train.reset_index(drop=True)\n",
+    "test = test.reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Переведя имеющиеся категориальные метки классов в численный вид, получим следующую таблицу:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>Unnamed: 0</th>\n",
+       "      <th>texts</th>\n",
+       "      <th>classes</th>\n",
+       "      <th>classes_n</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>728</td>\n",
+       "      <td>from aew@eosvcr.wimsey.bc.ca Alan Walford subj...</td>\n",
+       "      <td>comp.os.ms-windows.misc</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>10092</td>\n",
+       "      <td>from dougb@comm.mot.com Doug Bank subject re i...</td>\n",
+       "      <td>rec.sport.baseball</td>\n",
+       "      <td>9</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>2998</td>\n",
+       "      <td>from ferry@dutentb.et.tudelft.nl Ferry Toth su...</td>\n",
+       "      <td>sci.electronics</td>\n",
+       "      <td>12</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>17238</td>\n",
+       "      <td>from emcguire@intellection.com Ed McGuire subj...</td>\n",
+       "      <td>talk.politics.guns</td>\n",
+       "      <td>16</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>9335</td>\n",
+       "      <td>from ianf@random.se Ian Feldman subject inexpe...</td>\n",
+       "      <td>comp.sys.mac.hardware</td>\n",
+       "      <td>4</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "   Unnamed: 0                                              texts  \\\n",
+       "0         728  from aew@eosvcr.wimsey.bc.ca Alan Walford subj...   \n",
+       "1       10092  from dougb@comm.mot.com Doug Bank subject re i...   \n",
+       "2        2998  from ferry@dutentb.et.tudelft.nl Ferry Toth su...   \n",
+       "3       17238  from emcguire@intellection.com Ed McGuire subj...   \n",
+       "4        9335  from ianf@random.se Ian Feldman subject inexpe...   \n",
+       "\n",
+       "                   classes  classes_n  \n",
+       "0  comp.os.ms-windows.misc          2  \n",
+       "1       rec.sport.baseball          9  \n",
+       "2          sci.electronics         12  \n",
+       "3       talk.politics.guns         16  \n",
+       "4    comp.sys.mac.hardware          4  "
+      ]
+     },
+     "execution_count": 8,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train.head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Таблица частот встречаемости\n",
+    "\n",
+    "Самый простой представить слова в векторном виде -- проиндексировать их и закодировать векторами, в которых все компоненты будут равны 0, а компонента, соответствующая индексу слова, равна 1. Иначе говоря, мы работаем с матрицей $W$ размерности $k$, где $k$ это число уникальных слов в корпусе, а в рядах и столбцах находятся все эти слова. Мы ставим в ячейку матрицы 1, если слово в строке и колонке совпадает. \n",
+    "\n",
+    "![OneHot](http://1.bp.blogspot.com/-_c2pVR3A0HQ/VogUStUgFbI/AAAAAAAADQc/6V1M6zmAJmA/s1600/1-hot-vector.png)\n",
+    "\n",
+    "Такое представление слов называется *one-hot encoding*. Оно может быть иногда полезно, когда мы хотим работать со словами как с категориальными признаками, но не несёт совершенно никакой информации о значении слов. Как тогда мы можем закодировать значение слова?\n",
+    "\n",
+    "Здесь к нам приходит на помощь лингвистическая теория, появившаяся в середине прошлого века, и на которой, по сути, основаны все векторные модели слов (которым посвящен этот семинар). Эта теория называется дистрибутивной гипотезой и утверждает, что значение слова определяется его контекстом -- иначе говоря, словами, которые встречаются рядом с этим словом в тексте.\n",
+    "\n",
+    "Давайте будет подразумевать под контекстом некоторое число $n$ слева и справа от слова. Это число будем называть *окном*. К примеру, в предложении \"мама мыла раму\" окном размера 1 для слова \"мыла\" будет набор слов (\"мама\", \"раму\").\n",
+    "\n",
+    "Используя понятие окна и имеющуюся у нас матрицу $W$, мы можем переопределить значения в ячейках. Пусть теперь мы будем ставить в ячейку 1, если слово из *колонки* хоть раз встретилось внутри окна вокруг слова из *строки* во всём корпусе. \n",
+    "\n",
+    "![Binary](http://4.bp.blogspot.com/-JHmQeFhqgCU/VogqxZ2UdhI/AAAAAAAADQs/-rJ0QYDn_ws/s1600/distributional.png)\n",
+    "\n",
+    "\n",
+    "\n",
+    "Такая матрица называется бинарной матрицей совместной встречаемости, и она уже больше показывает о значении слов. Тем не менее, с помощью неё все ещё трудно отличить слова, которые часто встречаются в похожих контекстах. Здесь довольно логичным кажется переход от бинарных значений к собственно количеству появлений слова $w_1$ в контексте слова $w_2$: иначе говоря, сколько раз в корпусе слово \"мыла\" встретилась рядом со словом \"мама\".\n",
+    "\n",
+    "Попробуем построить такую матрицу."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_index(texts):\n",
+    "    word2index = dict()\n",
+    "    word_counts = Counter()\n",
+    "    for text in texts:\n",
+    "        for word in text:\n",
+    "            word_counts[word] += 1\n",
+    "            if word not in word2index:\n",
+    "                word2index[word] = len(word2index)\n",
+    "    return {index:word for word, index in word2index.items()}, word2index"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_skipgram_counts(texts, window=2):\n",
+    "    skipgram_counts = Counter()\n",
+    "    for text in texts:\n",
+    "        for id_fw, fw in enumerate(text):\n",
+    "            id_cw_min = max(0, id_fw - window)\n",
+    "            id_cw_max = min(len(text) - 1, id_fw + window)\n",
+    "            id_cws = [i for i in range(id_cw_min, id_cw_max + 1) if i != id_fw]\n",
+    "            for id_cw in id_cws:\n",
+    "                skipgram = (text[id_fw], text[id_cw])\n",
+    "                skipgram_counts[skipgram] += 1   \n",
+    "    return skipgram_counts"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_count_matrix(texts, skipgram_counts, word2index):\n",
+    "    row_indices = []\n",
+    "    col_indices = []\n",
+    "    dat_values = []\n",
+    "    for (word_1, word_2), sg_count in skipgram_counts.items():\n",
+    "        row_indices.append(word2index[word_1])\n",
+    "        col_indices.append(word2index[word_2])\n",
+    "        dat_values.append(sg_count)\n",
+    "    return sparse.csr_matrix((dat_values, (row_indices, col_indices)))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Задание: построить бинарную матрицу на основе значений количеств встречаемости"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_binary_matrix(texts, skipgram_counts, word2index):\n",
+    "    pass"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "texts = [text.split() for text in df.texts]\n",
+    "\n",
+    "index2word, word2index = build_index(texts)\n",
+    "skipgram_counts = build_skipgram_counts(texts)\n",
+    "count_matrix = build_count_matrix(texts, skipgram_counts, word2index)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def word_vector(word, matrix, word2index):\n",
+    "    index = word2index[word]\n",
+    "    if isinstance(matrix, sparse.csr_matrix):\n",
+    "        word_ = matrix.getrow(index)\n",
+    "    else:\n",
+    "        word_ = matrix[index:index + 1, :]\n",
+    "    return word_"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Матрица получилось очень разреженной, и с ней будет трудно работать. Чтобы не потерять информацию о контекстах, но при этом превратить матрицу в более удобную форму, мы можем использовать уже известные нам методы снижения размерности -- например, сингулярное разложение (SVD). \n",
+    "\n",
+    "Сингулярное разложение: $M = U \\Sigma V^T$. Линейное отображение: перевод из одной системы координат в другую, задаваемое матрицами V и U, и масштабирование, задаваемое диагональю $\\Sigma$."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def factorize_matrix(matrix, method='svd', k=300):\n",
+    "    if method == 'svd':\n",
+    "        try:\n",
+    "            u, s, vh = np.linalg.svd(matrix)\n",
+    "            return u\n",
+    "        except np.linalg.LinAlgError:\n",
+    "            _matrix = matrix.asfptype()\n",
+    "            u, s, vt = sparse.linalg.svds(_matrix, k=k)\n",
+    "            return u\n",
+    "    else:\n",
+    "        raise NotImplementedError"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "count_matrix = factorize_matrix(count_matrix)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "На основе уже известной нам формулы косинусной близости мы можем определять схожесть слов, сравнивая их вектора. Косинусная мера близости в векторной модели [Salton et. al, 1975]: \n",
+    "$ \\cos(d_i, d_j) = \\frac {d_i \\times d_j}{||d_i||||d_j||} = \\frac{\\sum_k f_{ki} \\times f_{kj}} {\\sqrt{(\\sum_k f_{ki})^2} \\sqrt{(\\sum_k f_{kj})^2}}$\n",
+    "\n",
+    "Если вектора нормированы на длину $||d_i|| = ||d_j|| = 1$, $ \\cos(d_i, d_j) = d_i \\times d_j$\n",
+    "\n",
+    "Помимо косинусной меры, существуют также и другие метрики сравнения векторов (Евклидова, Манхеттен, etc)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def most_similar(word, matrix, index2word, word2index, n=10):\n",
+    "    index = word2index[word]\n",
+    "    if isinstance(matrix, sparse.csr_matrix):\n",
+    "        word_ = matrix.getrow(index)\n",
+    "    else:\n",
+    "        word_ = matrix[index:index + 1, :]\n",
+    "    similarities = cosine_similarity(matrix, word_).flatten()\n",
+    "    indices = np.argsort(-similarities)\n",
+    "    return [(index2word[index_], similarities[index_]) for index_ in indices[0:n]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[('cat', 1.0),\n",
+       " ('Later', 0.6239945220951302),\n",
+       " ('CGm', 0.6208216162181581),\n",
+       " ('readme.wri', 0.6194394416898684),\n",
+       " ('****------->', 0.6159370929781216),\n",
+       " ('bidzos.letter', 0.6146603640532817),\n",
+       " ('frite20.zip', 0.6119155838660266),\n",
+       " ('read.me', 0.6108533368073816),\n",
+       " ('amass', 0.6096166777625556),\n",
+       " ('NCBH', 0.607692445122788)]"
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "most_similar('cat', count_matrix, index2word, word2index)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Тем не менее, для того, чтобы классифицировать тексты, нам нужно как-то получать представления предложений и документов из представлений слов. Этой задаче посвящена отдельная область, которая называется композициональная дистрибутивная семантика, и в ней применяются самые разные подходы, от категориальных логик до нейронных сетей.\n",
+    "\n",
+    "В нашей задаче мы будем использовать усреднение векторов слов. Это простой, но эффективный подход. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_matrix(sent, matrix, word2index):\n",
+    "    vector = np.zeros(shape=matrix.shape[1])\n",
+    "    counter = 0\n",
+    "    for word in sent:\n",
+    "        if word in word2index: \n",
+    "            try:\n",
+    "                vector = np.add(vector, word_vector(word, matrix, word2index))\n",
+    "                counter += 1\n",
+    "            except KeyError:\n",
+    "                pass\n",
+    "    if counter == 0:\n",
+    "        return vector.squeeze()\n",
+    "    return (vector / counter).squeeze()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Таким образом, мы можем получить векторное представление для каждого документа из датасета."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_matrix(text.split(), count_matrix, word2index) for text in train.texts]\n",
+    "test_vectors = [get_matrix(text.split(), count_matrix, word2index) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "И с помощью одного из известных нам классификаторов попробовать решить задачу классификации и определить качество её решения."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.26852674604585036"
+      ]
+     },
+     "execution_count": 20,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Метрики вероятности совместной встречаемости слов\n",
+    "\n",
+    "Бинарная и частотная матрицы это самые простые способы получения информации о контексте слова. Они не очень эффективны и не используют информацию о том, насколько характерно для данного документа само употребление слов в контексте.\n",
+    "\n",
+    "Метрика, которая лучше фиксирует эту информацию, называется PMI (Pointwise Mutual Information): здесь способ посчитать связь между двумя словами это узнать, насколько чаще они встречаются в корпусе вместе, чем если бы мы ожидали, что они появляются случайно. Иначе говоря, это мера того, как часто встречаются две случайные величины $w$ и $c$, по сравнению с тем, что мы ожидали бы, если бы они были независимыми:\n",
+    "\n",
+    "$$PMI_{w, c} =  \\log_2 \\frac{P(w, c)}{P(w)P(c)}.$$\n",
+    "\n",
+    "Значения PMI варьируются от -$\\infty$ до $\\infty$. Но отрицательные значения PMI, как правило, ненадежны: они говорят о том, что слова вместе встречаются реже, чем случайно. И если у нас нет очень большого корпуса, то эти редко встречающиеся пары слов будут зашумлять наши данные. По этой причине всегда лучше использовать метрику Positive PMI (сокращённо PPMI), которая заменяет все отрицательные значения PMI на ноль.\n",
+    "\n",
+    "$$PPMI_{w, c} = \\max(PMI_{w, c}, 0) = PMI_{w, c}^+$$\n",
+    "\n",
+    "Попробуем построить матрицу для этих метрик (которые называются соответственно *PMI-* и *PPMI-матрицами*):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "texts = [text.split() for text in df.texts][:100]\n",
+    "\n",
+    "index2word, word2index = build_index(texts)\n",
+    "skipgram_counts = build_skipgram_counts(texts)\n",
+    "count_matrix = build_count_matrix(texts, skipgram_counts, word2index)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from joblib import Parallel, delayed\n",
+    "import multiprocessing\n",
+    "\n",
+    "def compute_pmi(positive, sg_count, word1, word2, cms, word2index, sum_over_words, sum_over_contexts, sgc):\n",
+    "    words_prob = sg_count/cms\n",
+    "    word1_count = sum_over_contexts[word2index[word1]]\n",
+    "    word1_prob = word1_count/sgc\n",
+    "    word2_count = sum_over_words[word2index[word2]]\n",
+    "    word2_prob = word2_count/sgc\n",
+    "    PMI = np.log2(words_prob/(word1_prob*word2_prob))\n",
+    "    if positive:\n",
+    "        PMI = max(PMI, 0)\n",
+    "    return PMI"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_pmi_matrix(count_matrix, word2index, positive=False):\n",
+    "    row_indices = []\n",
+    "    col_indices = []\n",
+    "    pmi_dat_values = []\n",
+    "    num_cores = multiprocessing.cpu_count()\n",
+    "    cms = count_matrix.sum()\n",
+    "    sgc = len(skipgram_counts)\n",
+    "    sum_over_words = np.array(count_matrix.sum(axis=0)).flatten()\n",
+    "    sum_over_contexts = np.array(count_matrix.sum(axis=1)).flatten()\n",
+    "    pmi_dat_values = Parallel(n_jobs=num_cores)(delayed(compute_pmi)(positive, sg_count, word1,\\\n",
+    "                                                              word2, cms, word2index, sum_over_words,\\\n",
+    "                                                              sum_over_contexts, sgc) for (word1, word2), sg_count in skipgram_counts.items())\n",
+    "        \n",
+    "#         row_indices.append(word2index[word1])\n",
+    "#         col_indices.append(word2index[word2])\n",
+    "    return sparse.csr_matrix((pmi_dat_values, (row_indices, col_indices)))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pmi_matrix = build_pmi_matrix(count_matrix, word2index)\n",
+    "# ppmi_matrix = build_pmi_matrix(count_matrix, word2index, positive=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pmi_matrix = factorize_matrix(pmi_matrix)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "most_similar('my', pmi_matrix, index2word, word2index)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_matrix(text.split(), pmi_matrix, word2index) for text in train.texts]\n",
+    "test_vectors = [get_matrix(text.split(), pmi_matrix, word2index) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')vvv"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Терм-документная матрица\n",
+    "\n",
+    "С помощью известной нам формулы TF-IDF мы можем строить терм-документную матрицу и получать вектора не только для документов, но и для отдельных слов. Напомним, что такое TF-IDF:\n",
+    "\n",
+    "Рассмотрим коллекцию текстов $D$.  Для каждого уникального слова $t$ из документа $d \\in D$ вычислим следующие величины:\n",
+    "\n",
+    "**1. Term Frequency** – количество вхождений слова в отношении к общему числу слов в тексте:\n",
+    "$$\\text{tf}(t, d) = \\frac{n_{td}}{\\sum_{t \\in d} n_{td}},$$\n",
+    "где $n_{td}$ — количество вхождений слова $t$ в текст $d$.\n",
+    "\n",
+    "\n",
+    "**2. Inverse Document Frequency**\n",
+    "$$\\text{idf}(t, D) = \\log \\frac{\\left| D \\right|}{\\left| \\{d\\in D: t \\in d\\} \\right|},$$\n",
+    "где $\\left| \\{d\\in D: t \\in d\\} \\right|$ – количество текстов в коллекции, содержащих слово $t$.\n",
+    "\n",
+    "Тогда для каждой пары (слово, текст) $(t, d)$ вычислим величину:\n",
+    "$$\\text{tf-idf}(t,d, D) = \\text{tf}(t, d)\\cdot \\text{idf}(t, D).$$\n",
+    "\n",
+    "Отметим, что значение $\\text{tf}(t, d)$ корректируется для часто встречающихся общеупотребимых слов при помощи значения $\\text{idf}(t, D).$\n",
+    "\n",
+    "Признаковым описанием одного объекта $d \\in D$ будет вектор $\\bigg(\\text{tf-idf}(t,d, D)\\bigg)_{t\\in V}$, где $V$ – словарь всех слов, встречающихся в коллекции $D$."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 70,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_index(sentences):\n",
+    "    words_dict = {}\n",
+    "    for sentence_id, sentence in enumerate(sentences): \n",
+    "        for word in sentence:\n",
+    "            if word in words_dict:\n",
+    "                words_dict[word].append(sentence_id)\n",
+    "            else:\n",
+    "                words_dict[word] = [sentence_id]\n",
+    "    return words_dict"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 69,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_term_document_matrix(words_dict, sentence_count, min_value=1):\n",
+    "    words = [key for key, value in words_dict.items() if len(value) > min_value]\n",
+    "    A = np.zeros([len(words), sentence_count]) \n",
+    "    for word_id, word in enumerate(words):\n",
+    "        for sentence_id in words_dict[word]:\n",
+    "            A[word_id, sentence_id] += 1.0\n",
+    "    return A, words, dict(zip(words, range(len(words))))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 70,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def word_by_index(matrix, word2index, word):\n",
+    "    try:\n",
+    "        return matrix[word2index.index(word)]\n",
+    "    except ValueError:\n",
+    "        print('No such word in the matrix!')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 74,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def tf_idf(matrix):\n",
+    "    tf_idf_matrix = np.zeros(shape=matrix.shape) \n",
+    "    words_count = np.sum(matrix, axis=0)\n",
+    "    sentences_count = np.sum(matrix, axis=1)\n",
+    "    rows, columns = matrix.shape\n",
+    "    for i in range(rows):\n",
+    "        for j in range(columns):\n",
+    "            tf_idf_matrix[i,j] = (matrix[i, j] / words_count[j]) * log(columns / sentences_count[i])\n",
+    "    return tf_idf_matrix"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 91,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "index = build_index(texts)\n",
+    "term_document_matrix, index2word, word2index = build_term_document_matrix(index, len(texts))\n",
+    "tf_idf_matrix = tf_idf(term_document_matrix)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Эта матрица тоже является разреженной, поэтому мы её факторизуем."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 92,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tf_idf_matrix = factorize_matrix(tf_idf_matrix)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 93,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[('whole', 0.9999999999999972),\n",
+       " ('Cga', 5.949711887444711e-16),\n",
+       " ('2/3', 4.4165949584086366e-16),\n",
+       " ('30', 1.7714174726474554e-16),\n",
+       " ('understand', 1.4641345658116846e-16),\n",
+       " ('annoying', 1.243510011622725e-16),\n",
+       " ('Stefan', 1.1747923461943519e-16),\n",
+       " ('smack', 1.1681770188762958e-16),\n",
+       " ('read', 1.1289932747363118e-16),\n",
+       " ('Tom', 1.098389974352014e-16)]"
+      ]
+     },
+     "execution_count": 93,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "most_similar('whole', tf_idf_matrix, index2word, word2index)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Аналогичным образом мы можем построить вектора текстов:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 94,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_matrix(text.split(), tf_idf_matrix, word2index) for text in train.texts]\n",
+    "test_vectors = [get_matrix(text.split(), tf_idf_matrix, word2index) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 95,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.35596232450684195"
+      ]
+     },
+     "execution_count": 95,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Word2Vec\n",
+    "\n",
+    "Векторные модели, которые мы рассматривали до этого, условно называются *счётными*. Они основываются на том, что так или иначе \"считают\" всех соседей слова, и на основе метрики, использованной при подсчёте, строят вектора для слов. \n",
+    "\n",
+    "Другой класс моделей, который более повсевмёстно распространён на сегодняшний день, называется *предсказательными* (или *нейронными*) моделями. Идея этих моделей заключается в использовании нейросетевых архитектур, которые \"предсказывают\" (а не считают) соседей слов. Одной из самых известных таких моделей является Word2Vec. Word2Vec основана на нейронной сети, предсказывающей вероятность встретить слово в заданном контексте.\n",
+    "\n",
+    "$$\\hat{P}(w_1^T) = \\prod_{t=1}^T \\hat{P}(w_t \\mid w_1^{t-1})$$\n",
+    "\n",
+    "По сути, Word2Vec является обобщающим названием для двух архитектур, Skip-Gram и Continuous Bag-Of-Words. Мы задаём вектор для каждого слова с помощью матрицы $w$ и вектор контекста с помощью матрицы $W′$.\n",
+    "\n",
+    "В качестве примера можно попробовать обучить модель с помощью фреймворка gensim на небольшом наборе текстов. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 90,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "INFO:gensim.models.word2vec:collecting all words and their counts\n",
+      "INFO:gensim.models.word2vec:PROGRESS: at sentence #0, processed 0 words, keeping 0 word types\n",
+      "INFO:gensim.models.word2vec:collected 13646 word types from a corpus of 62201 raw words and 100 sentences\n",
+      "INFO:gensim.models.word2vec:Loading a fresh vocabulary\n",
+      "INFO:gensim.models.word2vec:effective_min_count=1 retains 13646 unique words (100% of original 13646, drops 0)\n",
+      "INFO:gensim.models.word2vec:effective_min_count=1 leaves 62201 word corpus (100% of original 62201, drops 0)\n",
+      "INFO:gensim.models.word2vec:deleting the raw counts dictionary of 13646 items\n",
+      "INFO:gensim.models.word2vec:sample=0.001 downsamples 30 most-common words\n",
+      "INFO:gensim.models.word2vec:downsampling leaves estimated 36716 word corpus (59.0% of prior 62201)\n",
+      "INFO:gensim.models.base_any2vec:estimated required memory for 13646 words and 100 dimensions: 17739800 bytes\n",
+      "INFO:gensim.models.word2vec:resetting layer weights\n",
+      "INFO:gensim.models.base_any2vec:training model with 3 workers on 13646 vocabulary and 100 features, using sg=0 hs=0 sample=0.001 negative=5 window=5\n",
+      "DEBUG:gensim.models.base_any2vec:job loop exiting, total 6 jobs\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 2 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 1 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 0 more threads\n",
+      "INFO:gensim.models.base_any2vec:EPOCH - 1 : training on 62201 raw words (36685 effective words) took 0.1s, 650292 effective words/s\n",
+      "DEBUG:gensim.models.base_any2vec:job loop exiting, total 6 jobs\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 2 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 1 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 0 more threads\n",
+      "INFO:gensim.models.base_any2vec:EPOCH - 2 : training on 62201 raw words (36654 effective words) took 0.1s, 630514 effective words/s\n",
+      "DEBUG:gensim.models.base_any2vec:job loop exiting, total 6 jobs\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 1 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 2 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 1 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 3 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 0 more threads\n",
+      "INFO:gensim.models.base_any2vec:EPOCH - 3 : training on 62201 raw words (36762 effective words) took 0.0s, 786203 effective words/s\n",
+      "DEBUG:gensim.models.base_any2vec:job loop exiting, total 6 jobs\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 2 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 1 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 0 more threads\n",
+      "INFO:gensim.models.base_any2vec:EPOCH - 4 : training on 62201 raw words (36735 effective words) took 0.1s, 580887 effective words/s\n",
+      "DEBUG:gensim.models.base_any2vec:job loop exiting, total 6 jobs\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 2 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 1 more threads\n",
+      "DEBUG:gensim.models.base_any2vec:worker exiting, processed 2 jobs\n",
+      "INFO:gensim.models.base_any2vec:worker thread finished; awaiting finish of 0 more threads\n",
+      "INFO:gensim.models.base_any2vec:EPOCH - 5 : training on 62201 raw words (36656 effective words) took 0.1s, 547634 effective words/s\n",
+      "INFO:gensim.models.base_any2vec:training on a 311005 raw words (183492 effective words) took 0.3s, 582583 effective words/s\n"
+     ]
+    }
+   ],
+   "source": [
+    "test_model = Word2Vec(texts[:100], size=100, window=5, min_count=1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Для классификации текстов мы будем использовать модель, уже обученную на Википедии, поскольку процесс обучения занимает продолжительное время (несколько часов). "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 88,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "INFO:gensim.models.utils_any2vec:loading projection weights from data/word2vec-wiki/model.txt\n",
+      "DEBUG:smart_open.smart_open_lib:{'kw': {}, 'mode': 'rb', 'uri': 'data/word2vec-wiki/model.txt'}\n",
+      "DEBUG:smart_open.smart_open_lib:encoding_wrapper: {'errors': 'strict', 'encoding': None, 'mode': 'rb', 'fileobj': <_io.BufferedReader name='data/word2vec-wiki/model.txt'>}\n"
+     ]
+    },
+    {
+     "ename": "KeyboardInterrupt",
+     "evalue": "",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mKeyboardInterrupt\u001b[0m                         Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-88-a38574bacce0>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m()\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mvectors\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mKeyedVectors\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mload_word2vec_format\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mpath\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mjoin\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m'data'\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'word2vec-wiki'\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'model.txt'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m~/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/models/keyedvectors.py\u001b[0m in \u001b[0;36mload_word2vec_format\u001b[0;34m(cls, fname, fvocab, binary, encoding, unicode_errors, limit, datatype)\u001b[0m\n\u001b[1;32m   1434\u001b[0m         return _load_word2vec_format(\n\u001b[1;32m   1435\u001b[0m             \u001b[0mcls\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfname\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfvocab\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mfvocab\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mbinary\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mbinary\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mencoding\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mencoding\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0municode_errors\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0municode_errors\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 1436\u001b[0;31m             limit=limit, datatype=datatype)\n\u001b[0m\u001b[1;32m   1437\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1438\u001b[0m     \u001b[0;32mdef\u001b[0m \u001b[0mget_keras_embedding\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mself\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mtrain_embeddings\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;32mFalse\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/models/utils_any2vec.py\u001b[0m in \u001b[0;36m_load_word2vec_format\u001b[0;34m(cls, fname, fvocab, binary, encoding, unicode_errors, limit, datatype)\u001b[0m\n\u001b[1;32m    220\u001b[0m                 \u001b[0;32mif\u001b[0m \u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mparts\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m!=\u001b[0m \u001b[0mvector_size\u001b[0m \u001b[0;34m+\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    221\u001b[0m                     \u001b[0;32mraise\u001b[0m \u001b[0mValueError\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m\"invalid vector on line %s (is this really the text format?)\"\u001b[0m \u001b[0;34m%\u001b[0m \u001b[0mline_no\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 222\u001b[0;31m                 \u001b[0mword\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mweights\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mparts\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m[\u001b[0m\u001b[0mdatatype\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;32mfor\u001b[0m \u001b[0mx\u001b[0m \u001b[0;32min\u001b[0m \u001b[0mparts\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    223\u001b[0m                 \u001b[0madd_word\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mword\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mweights\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    224\u001b[0m     \u001b[0;32mif\u001b[0m \u001b[0mresult\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvectors\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mshape\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m \u001b[0;34m!=\u001b[0m \u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mresult\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvocab\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/models/utils_any2vec.py\u001b[0m in \u001b[0;36m<listcomp>\u001b[0;34m(.0)\u001b[0m\n\u001b[1;32m    220\u001b[0m                 \u001b[0;32mif\u001b[0m \u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mparts\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m!=\u001b[0m \u001b[0mvector_size\u001b[0m \u001b[0;34m+\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    221\u001b[0m                     \u001b[0;32mraise\u001b[0m \u001b[0mValueError\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m\"invalid vector on line %s (is this really the text format?)\"\u001b[0m \u001b[0;34m%\u001b[0m \u001b[0mline_no\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 222\u001b[0;31m                 \u001b[0mword\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mweights\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mparts\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m[\u001b[0m\u001b[0mdatatype\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;32mfor\u001b[0m \u001b[0mx\u001b[0m \u001b[0;32min\u001b[0m \u001b[0mparts\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    223\u001b[0m                 \u001b[0madd_word\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mword\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mweights\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    224\u001b[0m     \u001b[0;32mif\u001b[0m \u001b[0mresult\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvectors\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mshape\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m \u001b[0;34m!=\u001b[0m \u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mresult\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvocab\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;31mKeyboardInterrupt\u001b[0m: "
+     ]
+    }
+   ],
+   "source": [
+    "vectors = KeyedVectors.load_word2vec_format(path.join('data', 'word2vec-wiki', 'model.txt'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Эту модель я скачал с сайта http://vectors.nlpl.eu/repository. \n",
+    "\n",
+    "Модели для русского языка можно найти на сайте https://rusvectores.org/ru/.\n",
+    "\n",
+    "Мы можем аналогичным образом оперировать с векторами, используя встроенные функции библиотеки gensim. Например, найти похожие слова:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 79,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/matutils.py:737: FutureWarning: Conversion of the second argument of issubdtype from `int` to `np.signedinteger` is deprecated. In future, it will be treated as `np.int64 == np.dtype(int).type`.\n",
+      "  if np.issubdtype(vec.dtype, np.int):\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "[('▁apple', 0.6756024360656738),\n",
+       " ('crab', 0.4908433258533478),\n",
+       " ('pine', 0.48473429679870605),\n",
+       " ('▁iigs', 0.45598188042640686),\n",
+       " ('▁blossom', 0.4538702666759491),\n",
+       " ('▁cherry', 0.4511851370334625),\n",
+       " ('▁apples', 0.435860812664032),\n",
+       " ('cherry', 0.4262195825576782),\n",
+       " ('▁pineapple', 0.42597198486328125),\n",
+       " ('▁peach', 0.4220956563949585)]"
+      ]
+     },
+     "execution_count": 79,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "vectors.most_similar('apple')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Или вывести вектор для отдельного слова:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 81,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(300,)"
+      ]
+     },
+     "execution_count": 81,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "vectors['apple'].shape"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Или посчитать близость между двумя словами:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 83,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.6051609814167023"
+      ]
+     },
+     "execution_count": 83,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "cosine(vectors['apple'], vectors['peach'])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Более того, мы можем модифицировать значение слов, используя простые векторные операции. Скажем, мы можем сложить вектора двух слов, модифицировав таким образом их значения, и получим вектор модифицированного значения. У этого вектора не будет ассоциированного ему слова, но мы можем найти наиболее похожий на него вектор. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 85,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/matutils.py:737: FutureWarning: Conversion of the second argument of issubdtype from `int` to `np.signedinteger` is deprecated. In future, it will be treated as `np.int64 == np.dtype(int).type`.\n",
+      "  if np.issubdtype(vec.dtype, np.int):\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "[('woman', 0.7663812637329102),\n",
+       " ('king', 0.7141955494880676),\n",
+       " ('▁woman', 0.5007768869400024),\n",
+       " ('queen', 0.4720289707183838),\n",
+       " ('girl', 0.46661055088043213),\n",
+       " ('▁queen', 0.438289999961853),\n",
+       " ('▁king', 0.4348602294921875),\n",
+       " ('▁girl', 0.4216140806674957),\n",
+       " ('women', 0.4143710136413574),\n",
+       " ('the', 0.4077245891094208)]"
+      ]
+     },
+     "execution_count": 85,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "vectors.similar_by_vector(vectors['king'] + vectors['woman'], topn=10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Мы можем не только складывать эти вектора, но и вычитать их. Так работает знаменитый пример \"king - man + woman\"."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 86,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/.pyenv/versions/3.6.4/lib/python3.6/site-packages/gensim/matutils.py:737: FutureWarning: Conversion of the second argument of issubdtype from `int` to `np.signedinteger` is deprecated. In future, it will be treated as `np.int64 == np.dtype(int).type`.\n",
+      "  if np.issubdtype(vec.dtype, np.int):\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "[('woman', 0.6365295052528381),\n",
+       " ('king', 0.6132917404174805),\n",
+       " ('queen', 0.4607973098754883),\n",
+       " ('▁queen', 0.43559402227401733),\n",
+       " ('▁woman', 0.39679813385009766),\n",
+       " ('waiting', 0.3722027540206909),\n",
+       " ('women', 0.36717870831489563),\n",
+       " ('▁king', 0.35553276538848877),\n",
+       " ('mother', 0.35311853885650635),\n",
+       " ('sister', 0.34758228063583374)]"
+      ]
+     },
+     "execution_count": 86,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "vectors.similar_by_vector(vectors['king'] - vectors['man'] + vectors['woman'], topn=10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_vector(sent, model):\n",
+    "    vector = np.zeros(shape=model.vector_size)\n",
+    "    counter = 0\n",
+    "    for word in sent:\n",
+    "        if word in model.vocab: \n",
+    "            try:\n",
+    "                vector = np.add(vector, model[word])\n",
+    "                counter += 1\n",
+    "            except KeyError:\n",
+    "                pass\n",
+    "    if counter == 0:\n",
+    "        return vector\n",
+    "    return vector / counter"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_vector(text.split(' '), vectors) for text in train.texts]\n",
+    "test_vectors = [get_vector(text.split(' '), vectors) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.6255553580948996"
+      ]
+     },
+     "execution_count": 33,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# FastText\n",
+    "\n",
+    "FastText использует не только эмбеддинги слов, но и эмбеддинги n-грамов. В корпусе каждое слово автоматически представляется в виде набора символьных n-грамм. Скажем, если мы установим n=3, то вектор для слова \"where\" будет представлен суммой векторов следующих триграм: \"<wh\", \"whe\", \"her\", \"ere\", \"re>\" (где \"<\" и \">\" символы, обозначающие начало и конец слова). Благодаря этому мы можем также получать вектора для слов, отсутствуюших в словаре, а также эффективно работать с текстами, содержащими ошибки и опечатки.\n",
+    "\n",
+    "Для того, чтобы обучить такую модель, нужно использовать класс fastText. С уже обученными векторами можно работать через стандартный формат KeyedVectors. В официальной библиотеке fastText есть фича классификации текстов (основанная на той же логистической регрессии, но более быстрая)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "vectors = KeyedVectors.load_word2vec_format(path.join('data', 'fasttext-wiki', 'model.txt'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_vector(text.split(' '), vectors) for text in train.texts]\n",
+    "test_vectors = [get_vector(text.split(' '), vectors) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.7599075884130088"
+      ]
+     },
+     "execution_count": 36,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Для того, чтобы брать вектора OOV-слов, нужно загрузить матрицу в бинарном формате."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from gensim.models import FastText\n",
+    "\n",
+    "ft_model = FastText.load('model_path.model')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# BPE\n",
+    "\n",
+    "Модель, основанная на кодировании BPE (Byte Pair Encoding). Это один из способов представления текста, в котором мы используем в качестве токена не слова или символы, а наборы символов в зависимости от глубины кодирования.\n",
+    "\n",
+    "Скажем, мы хотим закодировать aaabdaaabac. В этой последовательности сочетание \"aa\" встречается наиболее часто. Мы можем \"слить\" эти буквы вместе и рассматривать их как отдельный символ. И так далее итеративно. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 47,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[['▁fr', 'ust', 'rated'],\n",
+       " ['▁that'],\n",
+       " ['▁my'],\n",
+       " ['▁application'],\n",
+       " ['▁be'],\n",
+       " ['▁not'],\n",
+       " ['▁give'],\n",
+       " ['▁back'],\n",
+       " ['▁system'],\n",
+       " ['▁resource']]"
+      ]
+     },
+     "execution_count": 47,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "from bpemb import BPEmb\n",
+    "\n",
+    "bpemb_en = BPEmb(lang='en', dim=50)\n",
+    "encoded_text = bpemb_en.encode(texts[0])\n",
+    "encoded_text[50:60]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "vectors = KeyedVectors.load_word2vec_format(path.join('data', 'en', 'en.wiki.bpe.vs100000.d300.w2v.txt'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_vectors = [get_vector(text.split(' '), vectors) for text in train.texts]\n",
+    "test_vectors = [get_vector(text.split(' '), vectors) for text in test.texts]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.6275102185889462"
+      ]
+     },
+     "execution_count": 42,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "clf = LogisticRegression(C=1)\n",
+    "clf.fit(train_vectors, train.classes_n)\n",
+    "preds = clf.predict(test_vectors)\n",
+    "f1_score(preds, test.classes_n, average='micro')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Оценка\n",
+    "\n",
+    "На данном семинаре мы сравнивали производительность разных моделей на задаче классификации. Однако что делать, если мы хотим оценить модель в отрыве от конкретной задачи? \n",
+    "\n",
+    "Такая оценка называется \"внутренней\" (intrinsic). Здесь мы пытаемся определить, насколько отношения между словами, задаваемые моделью, соотносятся с человеческими суждениями. Т.е. мы сравниваем слова сами по себе, без привязки к предложениям и другим лингвистическим структурам, на которых основаны \"внешние\" NLP-задачи.\n",
+    "\n",
+    "Для внутренней оценки мы будем использовать фреймворк Vecto."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 72,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "DEBUG:matplotlib.backends:backend module://ipykernel.pylab.backend_inline version unknown\n"
+     ]
+    }
+   ],
+   "source": [
+    "from vecto.benchmarks.analogy import Analogy\n",
+    "from vecto.benchmarks.similarity import Similarity\n",
+    "import vecto.embeddings"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Vecto использует свои собственные структуры для работы с векторными моделями, поэтому нужно загрузить модель в память ещё раз. Для простоты загрузим только одну из рассмотренных моделей, Word2Vec."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 73,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "INFO:vecto.embeddings:data/word2vec-wikiDetected VSM in plain text format\n"
+     ]
+    }
+   ],
+   "source": [
+    "embeddings = vecto.embeddings.load_from_dir(path.join('data', 'word2vec-wiki'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 74,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "embeddings.cache_normalized_copy()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "В Vecto можно также как и в Gensim получать вектора для слов или искать наиболее похожие слова из словаря модели:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 75,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[['apple', 1.0],\n",
+       " ['apples', 0.92355096],\n",
+       " ['peach', 0.88657045],\n",
+       " ['strawberry', 0.88087106],\n",
+       " ['pear', 0.87751687],\n",
+       " ['almond', 0.8654767],\n",
+       " ['cherries', 0.8635488],\n",
+       " ['pears', 0.8629199],\n",
+       " ['cherry', 0.8606704],\n",
+       " ['strawberries', 0.8509274]]"
+      ]
+     },
+     "execution_count": 75,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "embeddings.get_most_similar_words('apple')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Одна из наиболее распространённых задач для оценки называется Word Similarity. Она заключается в том, чтобы оценить, насколько представления о семантической близости слов в модели соотносятся с \"представлениями\" людей.\n",
+    "\n",
+    "| слово 1    | слово 2    | близость | \n",
+    "|------------|------------|----------|\n",
+    "| кошка      | собака     | 0.7      |  \n",
+    "| чашка      | кружка     | 0.9      |       \n",
+    "\n",
+    "Для каждой пары слов из заранее заданного датасета мы можем посчитать косинусное расстояние, и получить список таких значений близости. При этом у нас уже есть список значений близостей, сделанный людьми. Мы можем сравнить эти два списка и понять, насколько они похожи (например, посчитав корреляцию). Эта мера схожести должна говорить о том, насколько модель хорошо моделирует расстояния о слова.  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 76,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[{'experiment_setup': {'cnt_found_pairs_total': 2,\n",
+       "   'cnt_pairs_total': 2,\n",
+       "   'embeddings': {'_class': 'vecto.embeddings.dense.WordEmbeddingsDense',\n",
+       "    'normalized': True},\n",
+       "   'category': 'default',\n",
+       "   'dataset': 'ws',\n",
+       "   'method': 'cosine_distance',\n",
+       "   'language': 'en',\n",
+       "   'description': 'TEST FILE',\n",
+       "   'version': '-',\n",
+       "   'measurement': 'spearman',\n",
+       "   'task': 'similarity',\n",
+       "   'timestamp': '2019-02-02T14:26:25.144331',\n",
+       "   'default_measurement': 'spearman'},\n",
+       "  'result': {'spearman': -1},\n",
+       "  'details': []}]"
+      ]
+     },
+     "execution_count": 76,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "similarity = Similarity()\n",
+    "similarity.get_result(embeddings, path_dataset=path.join('data', 'similarity'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Другая популярная задача для \"внутренней\" оценки называется задачей поиска аналогий. Как мы уже разбирали выше, с помощью простых арифметических операций мы можем модифицировать значение слова. Если заранее собрать набор слов-модификаторов, а также слов, которые мы хотим получить в результаты модификации, то на основе подсчёта количества \"попаданий\" в желаемое слово мы можем оценить, насколько хорошо работает модель.\n",
+    "\n",
+    "В качестве слов-модификатор мы можем использовать семантические аналогии. Скажем, если у нас есть некоторое отношение \"страна-столица\", то для оценки модели мы можем использовать пары наподобие \"Россия-Москва\", \"Норвегия-Осло\", и т.д. Датасет будет выглядеть следующм образом:\n",
+    "\n",
+    "| слово 1    | слово 2    | отношение     | \n",
+    "|------------|------------|---------------|\n",
+    "| Россия     | Москва     | страна-столица|  \n",
+    "| Норвегия   | Осло       | страна-столица|\n",
+    "\n",
+    "Рассматривая случайные две пары из этого набора, мы хотим, имея триплет (Россия, Москва, Норвегия) хотим получить слово \"Осло\", т.е. найти такое слово, которое будет находиться в том же отношении со словом \"Норвегия\", как \"Россия\" находится с Москвой. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 77,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "INFO:vecto.benchmarks.analogy.analogy:processing data/analogy/category2/subcategory_b.txt\n",
+      " 75% (3 of 4) |###################       | Elapsed Time: 0:00:00 ETA:   0:00:00INFO:vecto.benchmarks.analogy.analogy:processing data/analogy/category1/subcategory_a.txt\n",
+      "100% (2 of 2) |##########################| Elapsed Time: 0:00:00 ETA:  00:00:00"
+     ]
+    }
+   ],
+   "source": [
+    "analogy = Analogy()\n",
+    "result = analogy.get_result(embeddings, path_dataset=path.join('data', 'analogy'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Кроме этих двух задач, существует множество других. Бенчмарки для них можно найти на сайте http://vecto.space."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
